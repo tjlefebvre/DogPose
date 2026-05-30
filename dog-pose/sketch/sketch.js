@@ -11,6 +11,10 @@ const JOINT_R_HOCK_WRIST   = 0.09;   // smallest: lower bend, near the paw
 // Hock (rear) / wrist (front) sits along the knee→paw line at this fraction.
 // (No DLC keypoint corresponds; we interpolate.)
 const HOCK_WRIST_T         = 0.55;
+
+// Silhouette backdrop opacity (0–255). Low — the polygon is contextual, not
+// dominant. Bumped/dimmed in Chunk F tuning.
+const SILHOUETTE_OPACITY   = 55;
 // Slot angles in frame {x=spine_dir (withers→hip), y=belly_dir (toward paws)}.
 // 0°=back of dog, 90°=down/belly, 180°=forward/nose, 270°=up/back-of-spine.
 // Legs hang from the belly side: front legs forward+down (~135°), back legs back+down (~45°).
@@ -378,19 +382,54 @@ function mid(a, b)    { return { x: (a.x+b.x)/2, y: (a.y+b.y)/2 }; }
 function add(a, v, s) { return { x: a.x + v.x*s, y: a.y + v.y*s }; }   // a + v*s
 function vdist(a, b)  { return Math.hypot(b.x-a.x, b.y-a.y); }
 
+function silhouetteCentroid(poly) {
+  // Shoelace centroid of a closed polygon. Falls back to vertex average for
+  // degenerate (zero-area) input.
+  if (!poly || poly.length < 3) return null;
+  let area = 0, cx = 0, cy = 0;
+  for (let i = 0; i < poly.length; i++) {
+    const [x0, y0] = poly[i];
+    const [x1, y1] = poly[(i + 1) % poly.length];
+    const cross = x0 * y1 - x1 * y0;
+    area += cross;
+    cx += (x0 + x1) * cross;
+    cy += (y0 + y1) * cross;
+  }
+  area *= 0.5;
+  if (Math.abs(area) < 1e-6) {
+    // Degenerate — average the vertices.
+    let sx = 0, sy = 0;
+    for (const [x, y] of poly) { sx += x; sy += y; }
+    return { x: sx / poly.length, y: sy / poly.length };
+  }
+  return { x: cx / (6 * area), y: cy / (6 * area) };
+}
+
 function computeFrame(an) {
   const spine_dir = vnorm(vec(an.withers, an.hip));
-
-  // belly_dir points toward the mean paw position
-  const paws = [an.paw_fl, an.paw_fr, an.paw_bl, an.paw_br];
-  const meanPaw = {
-    x: paws.reduce((s,p)=>s+p.x,0)/paws.length,
-    y: paws.reduce((s,p)=>s+p.y,0)/paws.length,
-  };
   const spineCenter = mid(an.withers, an.hip);
-  let belly = vnorm(vec(spineCenter, meanPaw));
-  // Fall back to the perpendicular if paws collapsed onto spine
-  if (len(vec(spineCenter, meanPaw)) < 5) belly = perp(spine_dir);
+
+  // Prefer the silhouette centroid (more stable across unusual poses than the
+  // mean paw position, which collapses when paws are missing or above the
+  // spine for lying-down dogs). Fall back to mean-paw, then to perpendicular.
+  let belly = null;
+  const silhouette = serverResponse && serverResponse.silhouette;
+  if (silhouette && silhouette.length >= 3) {
+    const centroid = silhouetteCentroid(silhouette);
+    if (centroid) {
+      const d = vec(spineCenter, centroid);
+      if (len(d) >= 5) belly = vnorm(d);
+    }
+  }
+  if (!belly) {
+    const paws = [an.paw_fl, an.paw_fr, an.paw_bl, an.paw_br];
+    const meanPaw = {
+      x: paws.reduce((s,p)=>s+p.x,0)/paws.length,
+      y: paws.reduce((s,p)=>s+p.y,0)/paws.length,
+    };
+    if (len(vec(spineCenter, meanPaw)) >= 5) belly = vnorm(vec(spineCenter, meanPaw));
+    else belly = perp(spine_dir);
+  }
 
   const forward_dir = vnorm(vec(an.withers, an.nose));
 
@@ -524,6 +563,22 @@ function drawConstruction(an, ox, oy, sc, ctx, forPrint) {
   function beginP() { if (ctx) ctx.beginShape(); else beginShape(); }
   function endP()   { if (ctx) ctx.endShape();   else endShape(); }
   function vtx(x,y) { if (ctx) ctx.vertex(x,y); else vertex(x,y); }
+
+  // ── Silhouette backdrop ────────────────────────────────────────────────────
+  // Faint outline of the dog from YOLO-seg; sits behind everything else so the
+  // sketcher sees the full body shape as context, not as a dominant primitive.
+  const silhouette = serverResponse && serverResponse.silhouette;
+  if (silhouette && silhouette.length >= 3) {
+    strokeCol(spineColor, SILHOUETTE_OPACITY, lineW * 0.8);
+    noF();
+    beginP();
+    for (const [sx_img, sy_img] of silhouette) {
+      vtx(ox + sx_img * sc, oy + sy_img * sc);
+    }
+    // close
+    vtx(ox + silhouette[0][0] * sc, oy + silhouette[0][1] * sc);
+    endP();
+  }
 
   // ── Spine line ──────────────────────────────────────────────────────────────
   noF();
