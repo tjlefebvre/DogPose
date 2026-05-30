@@ -28,8 +28,14 @@ SPREAD_CONFIDENCE_FLOOR = 0.30
 # COCO animal classes (dog=16, cat=15, horse=17, cow=19, sheep=18, bear=21, etc.)
 ANIMAL_CLASSES = [16]
 
+# Silhouette polygon simplification — Douglas-Peucker target.
+# Epsilon scales with bbox diagonal. Hard cap on point count keeps the JSON
+# payload small.
+SILHOUETTE_EPSILON_RATIO = 0.01    # 1% of bbox diagonal
+SILHOUETTE_MAX_POINTS    = 64
+
 dlc  = DLCLive(MODEL_PATH, processor=Processor())
-yolo = YOLO("yolov8n.pt")
+yolo = YOLO("yolov8n-seg.pt")      # seg variant gives us masks alongside bboxes
 _initialized = False
 
 
@@ -45,21 +51,23 @@ def _resize(frame):
 
 
 def _detect_crop(small_frame, margin=0.12):
-    """Locate the largest animal bbox in small_frame.
+    """Locate the largest animal bbox + mask polygon in small_frame.
 
-    Returns (crop, ox, oy, bbox_small, yolo_found) where:
+    Returns (crop, ox, oy, bbox_small, yolo_found, poly_small) where:
       - crop:        cropped pixel array (with margin)
       - ox, oy:      offset of crop inside small_frame
       - bbox_small:  YOLO bbox before margin, in small_frame coords (x1, y1, x2, y2).
                      If YOLO finds nothing, this is the full small_frame bounds.
       - yolo_found:  True iff YOLO returned at least one animal box.
+      - poly_small:  list of (x, y) tuples (small_frame coords) for the chosen
+                     subject's silhouette, or None if no mask is available.
     """
     h, w = small_frame.shape[:2]
     results = yolo(small_frame, classes=ANIMAL_CLASSES, verbose=False)
     boxes = results[0].boxes
     if boxes is None or len(boxes) == 0:
         print(f"  YOLO: no animal — using full {w}x{h} frame")
-        return small_frame, 0, 0, (0.0, 0.0, float(w), float(h)), False
+        return small_frame, 0, 0, (0.0, 0.0, float(w), float(h)), False, None
 
     areas = (boxes.xyxy[:, 2] - boxes.xyxy[:, 0]) * (boxes.xyxy[:, 3] - boxes.xyxy[:, 1])
     best  = int(areas.argmax())
@@ -67,6 +75,15 @@ def _detect_crop(small_frame, margin=0.12):
     conf  = float(boxes.conf[best].cpu())
     label = results[0].names[int(boxes.cls[best].cpu())]
     print(f"  YOLO: {label} ({conf:.2f})  bbox ({int(bx1)},{int(by1)})-({int(bx2)},{int(by2)})")
+
+    # Extract mask polygon for the chosen subject (seg variant only).
+    poly_small = None
+    masks = getattr(results[0], "masks", None)
+    if masks is not None and masks.xy is not None and best < len(masks.xy):
+        raw_poly = masks.xy[best]   # numpy [N, 2] in small_frame pixel coords
+        if raw_poly is not None and len(raw_poly) >= 3:
+            poly_small = [(float(x), float(y)) for x, y in raw_poly]
+            print(f"  mask: {len(poly_small)} raw polygon vertices")
 
     bw, bh = bx2 - bx1, by2 - by1
     x1 = int(max(0, bx1 - bw * margin))
@@ -76,7 +93,55 @@ def _detect_crop(small_frame, margin=0.12):
 
     crop = small_frame[y1:y2, x1:x2]
     print(f"  crop: {crop.shape[1]}x{crop.shape[0]}  offset ({x1},{y1})")
-    return crop, x1, y1, (bx1, by1, bx2, by2), True
+    return crop, x1, y1, (bx1, by1, bx2, by2), True, poly_small
+
+
+def _perp_distance(p, a, b):
+    """Perpendicular distance from p to the line segment a-b."""
+    ax, ay = a; bx, by = b; px, py = p
+    dx, dy = bx - ax, by - ay
+    seg2 = dx * dx + dy * dy
+    if seg2 < 1e-9:
+        return math.hypot(px - ax, py - ay)
+    # cross-product magnitude / segment length = perpendicular distance to the
+    # *infinite* line. For a tight polygon vertex this is the right measure.
+    return abs(dx * (ay - py) - dy * (ax - px)) / math.sqrt(seg2)
+
+
+def _douglas_peucker(points, epsilon):
+    """Standard recursive D-P simplification on an open polyline."""
+    if len(points) < 3:
+        return list(points)
+    a, b = points[0], points[-1]
+    max_d, max_i = 0.0, 0
+    for i in range(1, len(points) - 1):
+        d = _perp_distance(points[i], a, b)
+        if d > max_d:
+            max_d, max_i = d, i
+    if max_d > epsilon:
+        left  = _douglas_peucker(points[:max_i + 1], epsilon)
+        right = _douglas_peucker(points[max_i:], epsilon)
+        return left[:-1] + right
+    return [a, b]
+
+
+def _simplify_polygon(poly, epsilon, max_points):
+    """Simplify a *closed* polygon by D-P. Bumps epsilon until vertex count
+    fits under max_points (geometric back-off, ~5 iterations max)."""
+    if poly is None or len(poly) < 3:
+        return None
+    pts = list(poly)
+    # Treat as open polyline (D-P on a closed ring isn't well-defined as-is);
+    # the first vertex naturally re-closes when rendered.
+    eps = epsilon
+    for _ in range(6):
+        simp = _douglas_peucker(pts, eps)
+        if len(simp) <= max_points:
+            return simp
+        eps *= 1.6
+    # Last-resort: even spacing fallback.
+    step = max(1, len(pts) // max_points)
+    return pts[::step][:max_points]
 
 
 def _letterbox_to_dlc(crop):
@@ -139,7 +204,7 @@ def run_inference(image_file):
     print(f"  scaled to {small.shape[1]}x{small.shape[0]}  (scale={scale:.4f})")
 
     # 3. Detect + crop within the downscaled frame
-    crop, ox, oy, bbox_small, yolo_found = _detect_crop(small)
+    crop, ox, oy, bbox_small, yolo_found, poly_small = _detect_crop(small)
 
     # 4. Letterbox the crop to a square matching the DLC training input shape
     padded, l_scale, pad_x, pad_y = _letterbox_to_dlc(crop)
@@ -175,9 +240,23 @@ def run_inference(image_file):
     # 8. Failure detection: collapsed keypoints, OR YOLO found nothing.
     failed = (not yolo_found) or _spread_failed(keypoints, bbox_orig)
 
+    # 9. Silhouette polygon: map from small_frame coords to original, simplify.
+    silhouette = None
+    if poly_small is not None and len(poly_small) >= 3:
+        poly_orig = [(x / scale, y / scale) for (x, y) in poly_small]
+        bbox_diag = math.hypot(bbox_orig[2] - bbox_orig[0],
+                               bbox_orig[3] - bbox_orig[1])
+        eps = bbox_diag * SILHOUETTE_EPSILON_RATIO
+        simp = _simplify_polygon(poly_orig, eps, SILHOUETTE_MAX_POINTS)
+        if simp is not None:
+            silhouette = [[x, y] for (x, y) in simp]
+            print(f"  silhouette: {len(poly_orig)} -> {len(silhouette)} pts "
+                  f"(eps={eps:.1f}px)")
+
     return {
-        "keypoints": keypoints,
-        "bbox": bbox_orig,
-        "failed": failed,
+        "keypoints":  keypoints,
+        "bbox":       bbox_orig,
+        "failed":     failed,
         "image_size": [W, H],
+        "silhouette": silhouette,
     }

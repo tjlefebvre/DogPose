@@ -44,10 +44,12 @@ def summarise(result, image_w, image_h):
         kps = result.get("keypoints", [])
         bbox = result.get("bbox")
         failed = result.get("failed", False)
+        silhouette = result.get("silhouette")
     else:
         kps = result
         bbox = None
         failed = False
+        silhouette = None
 
     n_05 = sum(1 for k in kps if k["confidence"] >= 0.05)
     n_30 = sum(1 for k in kps if k["confidence"] >= 0.30)
@@ -78,6 +80,14 @@ def summarise(result, image_w, image_h):
     print(f"  kp spread    : {kp_diag:.0f}  ({100*kp_diag/bbox_diag:.1f}% of bbox diag, "
           f"{100*kp_diag/img_diag:.1f}% of image diag)")
     print(f"  failed flag  : {failed}")
+    if silhouette is not None:
+        sxs = [p[0] for p in silhouette]
+        sys = [p[1] for p in silhouette]
+        sbbox = (min(sxs), min(sys), max(sxs), max(sys))
+        print(f"  silhouette   : {len(silhouette)} pts  bbox "
+              f"({sbbox[0]:.0f},{sbbox[1]:.0f})-({sbbox[2]:.0f},{sbbox[3]:.0f})")
+    else:
+        print(f"  silhouette   : (none)")
     print()
     print(f"  {'id':>3} {'name':<22} {'x':>8} {'y':>8} {'conf':>6}")
     for k in kps:
