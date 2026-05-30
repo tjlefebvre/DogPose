@@ -14,7 +14,7 @@ const HOCK_WRIST_T         = 0.55;
 
 // Silhouette backdrop opacity (0–255). Low — the polygon is contextual, not
 // dominant. Bumped/dimmed in Chunk F tuning.
-const SILHOUETTE_OPACITY   = 55;
+const SILHOUETTE_OPACITY   = 75;
 // Slot angles in frame {x=spine_dir (withers→hip), y=belly_dir (toward paws)}.
 // 0°=back of dog, 90°=down/belly, 180°=forward/nose, 270°=up/back-of-spine.
 // Legs hang from the belly side: front legs forward+down (~135°), back legs back+down (~45°).
@@ -32,11 +32,17 @@ const HIP_SANITY_RATIO     = 0.55;
 // Haunch (rear thigh) + shoulder (front thigh) mass ovals.
 // Major axis runs root anchor (hip / withers) → detected thai keypoint.
 // Minor axis is `axisRatio` × major axis.
-const HAUNCH_AXIS_RATIO    = 0.60;   // rear thigh mass: chunky
-const SHOULDER_AXIS_RATIO  = 0.55;   // front shoulder: leaner
+//
+// Shoulder ovals can overwhelm the ribcage circle because the front_thai
+// keypoint sits low (near the elbow). We use a smaller axis ratio AND a
+// shorter major axis length scale (SHOULDER_LENGTH_SCALE) to keep them as
+// hints rather than dominant primitives.
+const HAUNCH_AXIS_RATIO     = 0.65;   // rear thigh mass: chunky
+const SHOULDER_AXIS_RATIO   = 0.45;   // front shoulder: leaner
+const SHOULDER_LENGTH_SCALE = 0.55;   // shoulder span = this × (withers↔thai)
 // The oval extends beyond the root↔thai segment by this fraction at each end,
 // so the visible ellipse wraps the joint instead of stopping at the keypoint.
-const MASS_LENGTH_OVERSHOOT = 0.25;
+const MASS_LENGTH_OVERSHOOT = 0.20;
 
 // ── State ────────────────────────────────────────────────────────────────────
 let img       = null;
@@ -595,15 +601,20 @@ function drawConstruction(an, ox, oy, sc, ctx, forPrint) {
     }
   }
   // Compute and draw a mass oval whose major axis runs from `root` (image-space)
-  // to `joint` (image-space). Returns null if joint missing.
-  function drawMassEllipse(root, joint, axisRatio) {
+  // toward `joint` (image-space). lengthScale shrinks/expands the major axis
+  // span around the midpoint (default 1.0 → full root↔joint distance).
+  // Returns false if joint missing or degenerate.
+  function drawMassEllipse(root, joint, axisRatio, lengthScale) {
     if (!root || !joint) return false;
-    const cx_img = (root.x + joint.x) / 2;
-    const cy_img = (root.y + joint.y) / 2;
     const dx = joint.x - root.x, dy = joint.y - root.y;
     const len = Math.hypot(dx, dy);
-    if (len < 4) return false;  // degenerate
-    const major = (len / 2) * (1 + MASS_LENGTH_OVERSHOOT);
+    if (len < 4) return false;
+    const k = (typeof lengthScale === 'number') ? lengthScale : 1.0;
+    // Center bias: when we shrink the span, keep the oval centred on the
+    // 50/50 midpoint of the segment, so the shoulder still hugs the thai end.
+    const cx_img = root.x + dx * 0.5;
+    const cy_img = root.y + dy * 0.5;
+    const major = (len * k / 2) * (1 + MASS_LENGTH_OVERSHOOT);
     const minor = major * axisRatio;
     const angle = Math.atan2(dy, dx);
     drawRotatedEllipse(ox + cx_img * sc, oy + cy_img * sc,
@@ -647,8 +658,8 @@ function drawConstruction(an, ox, oy, sc, ctx, forPrint) {
   const shoulder_fr_kp = getRawKp(KP.thigh_fr);
   drawMassEllipse(an.hip,     haunch_bl_kp,   HAUNCH_AXIS_RATIO);
   drawMassEllipse(an.hip,     haunch_br_kp,   HAUNCH_AXIS_RATIO);
-  drawMassEllipse(an.withers, shoulder_fl_kp, SHOULDER_AXIS_RATIO);
-  drawMassEllipse(an.withers, shoulder_fr_kp, SHOULDER_AXIS_RATIO);
+  drawMassEllipse(an.withers, shoulder_fl_kp, SHOULDER_AXIS_RATIO, SHOULDER_LENGTH_SCALE);
+  drawMassEllipse(an.withers, shoulder_fr_kp, SHOULDER_AXIS_RATIO, SHOULDER_LENGTH_SCALE);
 
   // ── Body circles (drawn on top of haunch/shoulder masses) ─────────────────
   noF();

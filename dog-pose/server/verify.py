@@ -86,6 +86,22 @@ def summarise(result, image_w, image_h):
         sbbox = (min(sxs), min(sys), max(sxs), max(sys))
         print(f"  silhouette   : {len(silhouette)} pts  bbox "
               f"({sbbox[0]:.0f},{sbbox[1]:.0f})-({sbbox[2]:.0f},{sbbox[3]:.0f})")
+
+        # Sanity assertions: point count under cap, polygon bbox roughly
+        # matches YOLO bbox.
+        assert len(silhouette) >= 3, "silhouette polygon too few points"
+        assert len(silhouette) <= 64, f"silhouette has {len(silhouette)} pts (cap=64)"
+        if bbox is not None:
+            bx1, by1, bx2, by2 = bbox
+            # Allow 15% slop on each side relative to the bbox span.
+            sx1, sy1, sx2, sy2 = sbbox
+            tol_x = max(20, 0.15 * (bx2 - bx1))
+            tol_y = max(20, 0.15 * (by2 - by1))
+            assert abs(sx1 - bx1) <= tol_x, f"silhouette x-min {sx1:.0f} vs bbox {bx1:.0f}"
+            assert abs(sy1 - by1) <= tol_y, f"silhouette y-min {sy1:.0f} vs bbox {by1:.0f}"
+            assert abs(sx2 - bx2) <= tol_x, f"silhouette x-max {sx2:.0f} vs bbox {bx2:.0f}"
+            assert abs(sy2 - by2) <= tol_y, f"silhouette y-max {sy2:.0f} vs bbox {by2:.0f}"
+            print(f"  silhouette OK: bbox match within ±{tol_x:.0f}px / ±{tol_y:.0f}px")
     else:
         print(f"  silhouette   : (none)")
     print()

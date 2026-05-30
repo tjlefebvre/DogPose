@@ -139,3 +139,78 @@ And server-side in `model.py`:
 DLC_INPUT_SIZE       = 400    // letterbox target before DLC
 FAILURE_SPREAD_RATIO = 0.20   // failed if kp-spread < ratio × bbox diagonal
 ```
+
+---
+
+## Phase 2 deltas (shipped)
+
+See [PLAN-phase2.md](PLAN-phase2.md) for the full plan and chunk breakdown. The
+sections above reflect Phase 1 only. Below is what actually changed in Phase 2.
+
+### Anchor set delta
+
+No new draggable anchors. Phase 2 adds *derived* points (ear bases, ear ends,
+mouth ends, four thigh joints, four knee joints) used by the renderer but
+sourced directly from the model — not part of the 10-anchor drag surface.
+
+### New primitives
+
+- **Silhouette backdrop** — YOLOv8n-seg polygon shipped from the server,
+  rendered as a faint closed polyline behind every other primitive.
+- **Haunch / shoulder mass ovals** — rotated ellipses anchored between
+  `hip ↔ back_thai` and `withers ↔ front_thai` (per side), drawn behind the
+  body circles so the circles read as torso volumes overlaid on the
+  shoulder/haunch masses.
+- **4-segment legs** — replaces the slot→thigh→knee→paw 3-segment leg with
+  `thigh → knee/elbow → hock/wrist → paw`. Hock/wrist has no DLC keypoint —
+  it's an interpolation along knee→paw at `HOCK_WRIST_T`.
+- **Neck cylinder** — two side lines tapering between the front body-circle
+  edge and the head sphere along the head→withers axis.
+- **Real ears + jaw line** — earbase/earend keypoints drive real ear
+  triangles; mouth-end keypoints drive the jaw line (auto-skipped on
+  breeds where the corners aren't visible to the model).
+- **Extended head cross-axes** — Loomis-style centre planes spanning the
+  full head sphere (nose↔back-of-skull, eye line across).
+
+### Geometry / behaviour deltas
+
+- Belly direction now comes from the silhouette centroid when present,
+  falling back to mean-paw.
+- Body radius `R` is clamped to `silhouette_half_width × 1.15` when the
+  keypoint-derived `R` overshoots by > 30%.
+- Hip falls back to `tail_base`-derived position when `back_end` is detected
+  far from `tail_base` (model often misplaces back_end).
+- Head centre / radius derives from ear-midpoint ↔ nose when both earbases
+  are detected (more stable than the eye-based estimate).
+- Leg "slot" concept eliminated — the `thai` keypoint *is* the body
+  attachment.
+
+### Render order (back to front)
+
+```
+silhouette → spine → haunch/shoulder ovals → ribcage + pelvis circles →
+neck cylinder → 4-segment legs → tail → head sphere + axes + muzzle +
+ears + jaw → draggable handles
+```
+
+### Phase 2 tuning constants (`sketch.js`)
+
+```
+HAUNCH_AXIS_RATIO       = 0.65
+SHOULDER_AXIS_RATIO     = 0.45
+SHOULDER_LENGTH_SCALE   = 0.55   // shrinks shoulder span vs full withers↔thai
+MASS_LENGTH_OVERSHOOT   = 0.20
+JOINT_R_HIP_SHOULDER    = 0.18
+JOINT_R_KNEE_ELBOW      = 0.13
+JOINT_R_HOCK_WRIST      = 0.09
+HOCK_WRIST_T            = 0.55
+DETAIL_CONFIDENCE       = 0.25   // floor for joints / ears / jaw / mass ovals
+SILHOUETTE_OPACITY      = 75
+```
+
+### Phase 2 server constants (`model.py`)
+
+```
+SILHOUETTE_EPSILON_RATIO = 0.01   // Douglas-Peucker epsilon, × bbox diagonal
+SILHOUETTE_MAX_POINTS    = 64     // hard cap on polygon vertex count
+```
