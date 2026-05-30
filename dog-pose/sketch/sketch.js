@@ -17,6 +17,15 @@ const CONFIDENCE_CONFIDENT = 0.60;   // above this → small faded handle; other
 // treat it as a model error and use tail_base as the hip instead.
 const HIP_SANITY_RATIO     = 0.55;
 
+// Haunch (rear thigh) + shoulder (front thigh) mass ovals.
+// Major axis runs root anchor (hip / withers) → detected thai keypoint.
+// Minor axis is `axisRatio` × major axis.
+const HAUNCH_AXIS_RATIO    = 0.60;   // rear thigh mass: chunky
+const SHOULDER_AXIS_RATIO  = 0.55;   // front shoulder: leaner
+// The oval extends beyond the root↔thai segment by this fraction at each end,
+// so the visible ellipse wraps the joint instead of stopping at the keypoint.
+const MASS_LENGTH_OVERSHOOT = 0.25;
+
 // ── State ────────────────────────────────────────────────────────────────────
 let img       = null;
 let serverResponse = null;   // full response from /predict: {keypoints, bbox, failed, image_size}
@@ -480,6 +489,34 @@ function drawConstruction(an, ox, oy, sc, ctx, forPrint) {
     if (ctx) ctx.ellipse(cx,cy,rw*2,rh*2);
     else ellipse(cx,cy,rw*2,rh*2);
   }
+  // Rotated ellipse via push/translate/rotate. angle is in radians.
+  function drawRotatedEllipse(cx, cy, rw, rh, angle) {
+    if (ctx) {
+      ctx.push(); ctx.translate(cx, cy); ctx.rotate(angle);
+      ctx.ellipse(0, 0, rw*2, rh*2);
+      ctx.pop();
+    } else {
+      push(); translate(cx, cy); rotate(angle);
+      ellipse(0, 0, rw*2, rh*2);
+      pop();
+    }
+  }
+  // Compute and draw a mass oval whose major axis runs from `root` (image-space)
+  // to `joint` (image-space). Returns null if joint missing.
+  function drawMassEllipse(root, joint, axisRatio) {
+    if (!root || !joint) return false;
+    const cx_img = (root.x + joint.x) / 2;
+    const cy_img = (root.y + joint.y) / 2;
+    const dx = joint.x - root.x, dy = joint.y - root.y;
+    const len = Math.hypot(dx, dy);
+    if (len < 4) return false;  // degenerate
+    const major = (len / 2) * (1 + MASS_LENGTH_OVERSHOOT);
+    const minor = major * axisRatio;
+    const angle = Math.atan2(dy, dx);
+    drawRotatedEllipse(ox + cx_img * sc, oy + cy_img * sc,
+                       major * sc, minor * sc, angle);
+    return true;
+  }
   function beginP() { if (ctx) ctx.beginShape(); else beginShape(); }
   function endP()   { if (ctx) ctx.endShape();   else endShape(); }
   function vtx(x,y) { if (ctx) ctx.vertex(x,y); else vertex(x,y); }
@@ -494,6 +531,21 @@ function drawConstruction(an, ox, oy, sc, ctx, forPrint) {
   strokeCol(bodyColor, 200, lineW);
   drawCircle(frontCX, frontCY, Rsc);
   drawCircle(backCX,  backCY,  Rsc);
+
+  // ── Haunch + shoulder mass ovals ───────────────────────────────────────────
+  // Visible secondary masses where the rear thighs and front shoulders sit.
+  // Major axis: hip → back_thai (haunch) or withers → front_thai (shoulder).
+  // Skipped when the relevant thai keypoint is below DETAIL_CONFIDENCE.
+  noF();
+  strokeCol(bodyColor, 140, lineW * 0.9);
+  const haunch_bl_kp = getRawKp(KP.thigh_bl);
+  const haunch_br_kp = getRawKp(KP.thigh_br);
+  const shoulder_fl_kp = getRawKp(KP.thigh_fl);
+  const shoulder_fr_kp = getRawKp(KP.thigh_fr);
+  drawMassEllipse(an.hip,     haunch_bl_kp,   HAUNCH_AXIS_RATIO);
+  drawMassEllipse(an.hip,     haunch_br_kp,   HAUNCH_AXIS_RATIO);
+  drawMassEllipse(an.withers, shoulder_fl_kp, SHOULDER_AXIS_RATIO);
+  drawMassEllipse(an.withers, shoulder_fr_kp, SHOULDER_AXIS_RATIO);
 
   // ── Legs ───────────────────────────────────────────────────────────────────
   strokeCol(legColor, 200, lineW);
