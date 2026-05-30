@@ -434,7 +434,24 @@ function computeFrame(an) {
   const forward_dir = vnorm(vec(an.withers, an.nose));
 
   const S = vdist(an.withers, an.hip);
-  const R = BODY_RADIUS_K * S;
+  let   R = BODY_RADIUS_K * S;
+
+  // Silhouette-driven radius clamp: the keypoint-derived R sometimes blows up
+  // (e.g. when withers / hip are mispredicted far apart). The silhouette gives
+  // us the dog's actual half-width perpendicular to the spine — if R exceeds
+  // that by > 30%, clamp it gently back to ~115% of the half-width.
+  if (silhouette && silhouette.length >= 3) {
+    const perpDir = perp(spine_dir);  // unit perpendicular to spine
+    let maxAbsPerp = 0;
+    for (const [vx, vy] of silhouette) {
+      const dx = vx - spineCenter.x, dy = vy - spineCenter.y;
+      const along = Math.abs(dx * perpDir.x + dy * perpDir.y);
+      if (along > maxAbsPerp) maxAbsPerp = along;
+    }
+    if (maxAbsPerp > 1 && R > maxAbsPerp * 1.3) {
+      R = maxAbsPerp * 1.15;
+    }
+  }
 
   return { spine_dir, belly_dir: belly, forward_dir, S, R };
 }
@@ -490,12 +507,45 @@ function drawConstruction(an, ox, oy, sc, ctx, forPrint) {
   const frame = computeFrame(an);
   const { spine_dir, belly_dir, R, S } = frame;
 
-  // Canvas-space body centres
-  const frontCX = ox + add(an.withers, belly_dir, R).x * sc;
-  const frontCY = oy + add(an.withers, belly_dir, R).y * sc;
-  const backCX  = ox + add(an.hip,     belly_dir, R).x * sc;
-  const backCY  = oy + add(an.hip,     belly_dir, R).y * sc;
+  // Image-space + canvas-space body centres (shared across multiple sections).
+  const frontC_img = add(an.withers, belly_dir, R);
+  const backC_img  = add(an.hip,     belly_dir, R);
+  const frontCX = ox + frontC_img.x * sc;
+  const frontCY = oy + frontC_img.y * sc;
+  const backCX  = ox + backC_img.x  * sc;
+  const backCY  = oy + backC_img.y  * sc;
   const Rsc     = R * sc;
+
+  // ── Head geometry (hoisted so the neck cylinder can use it) ────────────────
+  // Prefer ear-midpoint↔nose axis (more stable on dark-faced dogs); fall back
+  // to nose↔eye-midpoint, then to eye-distance.
+  const r_earbase_raw = getRawKp(KP.right_earbase);
+  const l_earbase_raw = getRawKp(KP.left_earbase);
+  const eyeMid  = mid(an.right_eye, an.left_eye);
+  const eyeDist = vdist(an.right_eye, an.left_eye);
+  const noseToEyeMid = vdist(eyeMid, an.nose);
+  let headC, headR;
+  if (r_earbase_raw && l_earbase_raw) {
+    const earMid = mid(r_earbase_raw, l_earbase_raw);
+    headC = { x: earMid.x * 0.6 + an.nose.x * 0.4,
+              y: earMid.y * 0.6 + an.nose.y * 0.4 };
+    const earSpan = vdist(r_earbase_raw, l_earbase_raw);
+    const noseToEar = vdist(earMid, an.nose);
+    headR = Math.max(noseToEar * 0.65, earSpan * 0.55);
+  } else if (noseToEyeMid > eyeDist * 0.4) {
+    headC = { x: eyeMid.x + (eyeMid.x - an.nose.x) * 0.25,
+              y: eyeMid.y + (eyeMid.y - an.nose.y) * 0.25 };
+    headR = HEAD_RADIUS_K * noseToEyeMid * 1.6;
+  } else {
+    headC = eyeMid;
+    headR = HEAD_RADIUS_K_EYES * eyeDist;
+  }
+  const headCX  = ox + headC.x * sc;
+  const headCY  = oy + headC.y * sc;
+  const headRsc = headR * sc;
+  // Shared head axes.
+  const noseVec = vnorm(vec(headC, an.nose));        // forward (skull → nose)
+  const sideVec = { x: -noseVec.y, y: noseVec.x };   // perpendicular (left side)
 
   const lineW = forPrint ? 1.5 : 2;
   const bodyColor  = forPrint ? [60, 100, 180]  : [100, 160, 255];
@@ -585,13 +635,7 @@ function drawConstruction(an, ox, oy, sc, ctx, forPrint) {
   strokeCol(spineColor, 120, lineW);
   drawLine(px(an.withers), py(an.withers), px(an.hip), py(an.hip));
 
-  // ── Body circles ───────────────────────────────────────────────────────────
-  noF();
-  strokeCol(bodyColor, 200, lineW);
-  drawCircle(frontCX, frontCY, Rsc);
-  drawCircle(backCX,  backCY,  Rsc);
-
-  // ── Haunch + shoulder mass ovals ───────────────────────────────────────────
+  // ── Haunch + shoulder mass ovals (drawn behind body circles) ──────────────
   // Visible secondary masses where the rear thighs and front shoulders sit.
   // Major axis: hip → back_thai (haunch) or withers → front_thai (shoulder).
   // Skipped when the relevant thai keypoint is below DETAIL_CONFIDENCE.
@@ -606,6 +650,35 @@ function drawConstruction(an, ox, oy, sc, ctx, forPrint) {
   drawMassEllipse(an.withers, shoulder_fl_kp, SHOULDER_AXIS_RATIO);
   drawMassEllipse(an.withers, shoulder_fr_kp, SHOULDER_AXIS_RATIO);
 
+  // ── Body circles (drawn on top of haunch/shoulder masses) ─────────────────
+  noF();
+  strokeCol(bodyColor, 200, lineW);
+  drawCircle(frontCX, frontCY, Rsc);
+  drawCircle(backCX,  backCY,  Rsc);
+
+  // ── Neck cylinder ──────────────────────────────────────────────────────────
+  // Two side lines between the front body-circle edge and the head-circle edge
+  // along the head→withers direction. Read as a tapered tube.
+  {
+    const neckDir_img = vnorm(vec(frontC_img, headC));
+    const neckSpan = vdist(frontC_img, headC);
+    if (neckSpan > 1) {
+      const neckBot = add(frontC_img, neckDir_img, R);
+      const neckTop = add(headC,      neckDir_img, -headR);
+      const sideN   = { x: -neckDir_img.y, y: neckDir_img.x };
+      const wBot = R * 0.55;
+      const wTop = headR * 0.55;
+      const b1 = add(neckBot, sideN,  wBot);
+      const b2 = add(neckBot, sideN, -wBot);
+      const t1 = add(neckTop, sideN,  wTop);
+      const t2 = add(neckTop, sideN, -wTop);
+      strokeCol(bodyColor, 150, lineW * 0.9);
+      noF();
+      drawLine(ox + b1.x*sc, oy + b1.y*sc, ox + t1.x*sc, oy + t1.y*sc);
+      drawLine(ox + b2.x*sc, oy + b2.y*sc, ox + t2.x*sc, oy + t2.y*sc);
+    }
+  }
+
   // ── Legs ───────────────────────────────────────────────────────────────────
   // 4-segment construction (Loomis / Walt Stanchfield style):
   //   thigh (hip/shoulder) → knee (stifle/elbow) → hock/wrist → paw
@@ -614,11 +687,6 @@ function drawConstruction(an, ox, oy, sc, ctx, forPrint) {
   // along knee→paw at HOCK_WRIST_T. Joint balls scale by anatomical importance.
   strokeCol(legColor, 200, lineW);
   noF();
-
-  // Body-circle centres in image-space, used only as a fallback when the
-  // *_thai keypoint isn't detected.
-  const frontC_img = add(an.withers, belly_dir, R);
-  const backC_img  = add(an.hip,     belly_dir, R);
 
   const legDefs = [
     { fallbackAngle: SLOT_FRONT_LEFT_DEG,  center: an.withers, bodyC: frontC_img, paw: an.paw_fl, thighId: KP.thigh_fl, kneeId: KP.knee_fl },
@@ -685,65 +753,9 @@ function drawConstruction(an, ox, oy, sc, ctx, forPrint) {
   noF();
   drawLine(px(an.tail_base), py(an.tail_base), px(an.tail_end), py(an.tail_end));
 
-  // ── Head ───────────────────────────────────────────────────────────────────
-  // When both ear bases are detected, use the ear-mid ↔ nose axis as the head's
-  // anatomical axis (more accurate than eyes, which often have low confidence).
-  // Falls back to nose↔eye-midpoint, then to eye-distance only.
-  const r_earbase_raw = getRawKp(KP.right_earbase);
-  const l_earbase_raw = getRawKp(KP.left_earbase);
-  const eyeMid  = mid(an.right_eye, an.left_eye);
-  const eyeDist = vdist(an.right_eye, an.left_eye);
-  const noseToEyeMid = vdist(eyeMid, an.nose);
-  let headC, headR;
-  if (r_earbase_raw && l_earbase_raw) {
-    const earMid = mid(r_earbase_raw, l_earbase_raw);
-    // Head center sits between nose and ear-midpoint, biased toward the skull.
-    headC = { x: earMid.x * 0.6 + an.nose.x * 0.4,
-              y: earMid.y * 0.6 + an.nose.y * 0.4 };
-    const earSpan = vdist(r_earbase_raw, l_earbase_raw);
-    const noseToEar = vdist(earMid, an.nose);
-    // Radius covers both the muzzle axis length and the ear-span half-width.
-    headR = Math.max(noseToEar * 0.65, earSpan * 0.55);
-  } else if (noseToEyeMid > eyeDist * 0.4) {
-    // Use nose↔eye-midpoint as the dominant axis.
-    headC = { x: eyeMid.x + (eyeMid.x - an.nose.x) * 0.25,
-              y: eyeMid.y + (eyeMid.y - an.nose.y) * 0.25 };
-    headR = HEAD_RADIUS_K * noseToEyeMid * 1.6;
-  } else {
-    headC = eyeMid;
-    headR = HEAD_RADIUS_K_EYES * eyeDist;
-  }
-  const headCX   = ox + headC.x * sc;
-  const headCY   = oy + headC.y * sc;
-  const headRsc  = headR * sc;
-
-  // Common axes used by head + neck primitives.
-  const noseVec = vnorm(vec(headC, an.nose));  // forward (skull → nose)
-  const sideVec = { x: -noseVec.y, y: noseVec.x };  // perpendicular (left side)
-
-  // ── Neck cylinder ──────────────────────────────────────────────────────────
-  // Two side lines between the front body-circle edge and the head-circle edge,
-  // along the head→withers direction. Read as a tapered tube.
-  const frontC_img2 = frontC_img;  // image-space front body centre
-  const neckDir_img = vnorm(vec(frontC_img2, headC));
-  const neckSpan = vdist(frontC_img2, headC);
-  if (neckSpan > 1) {
-    const neckBot = add(frontC_img2, neckDir_img, R);            // front body edge
-    const neckTop = add(headC,       neckDir_img, -headR);        // head edge
-    const sideN   = { x: -neckDir_img.y, y: neckDir_img.x };
-    const wBot = R * 0.55;
-    const wTop = headR * 0.55;
-    const b1 = add(neckBot, sideN,  wBot);
-    const b2 = add(neckBot, sideN, -wBot);
-    const t1 = add(neckTop, sideN,  wTop);
-    const t2 = add(neckTop, sideN, -wTop);
-    strokeCol(bodyColor, 150, lineW * 0.9);
-    noF();
-    drawLine(ox + b1.x*sc, oy + b1.y*sc, ox + t1.x*sc, oy + t1.y*sc);
-    drawLine(ox + b2.x*sc, oy + b2.y*sc, ox + t2.x*sc, oy + t2.y*sc);
-  }
-
   // ── Head sphere + construction lines ──────────────────────────────────────
+  // headC, headR, headCX/CY, headRsc, noseVec, sideVec computed up-top so the
+  // neck cylinder section can also use them.
   strokeCol(headColor, 200, lineW);
   noF();
   drawCircle(headCX, headCY, headRsc);
