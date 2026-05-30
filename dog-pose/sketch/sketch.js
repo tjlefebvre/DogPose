@@ -2,7 +2,15 @@
 const BODY_RADIUS_K        = 0.30;   // R = K × dist(withers, hip)
 const HEAD_RADIUS_K         = 0.70;  // R = K × dist(ear_mid, nose)  — replaces eye-distance scheme
 const HEAD_RADIUS_K_EYES    = 1.5;   // R = K × dist(eyes)            — kept for eyes-only fallback
-const KNEE_CIRCLE_K        = 0.15;   // knee circle radius = K × body radius
+// Joint ball radii as fractions of body radius R, ordered by anatomical
+// importance. Capped at runtime by adjacent segment length × 0.45 so a small
+// segment can never get swamped by its joint ball.
+const JOINT_R_HIP_SHOULDER = 0.18;   // largest: where the leg meets the body
+const JOINT_R_KNEE_ELBOW   = 0.13;   // medium:  major mid-leg bend
+const JOINT_R_HOCK_WRIST   = 0.09;   // smallest: lower bend, near the paw
+// Hock (rear) / wrist (front) sits along the knee→paw line at this fraction.
+// (No DLC keypoint corresponds; we interpolate.)
+const HOCK_WRIST_T         = 0.55;
 // Slot angles in frame {x=spine_dir (withers→hip), y=belly_dir (toward paws)}.
 // 0°=back of dog, 90°=down/belly, 180°=forward/nose, 270°=up/back-of-spine.
 // Legs hang from the belly side: front legs forward+down (~135°), back legs back+down (~45°).
@@ -74,10 +82,6 @@ const KP = {
 
 // Confidence floor for joint/ear/jaw detail keypoints (separate from anchors).
 const DETAIL_CONFIDENCE  = 0.25;
-
-// Fallback interpolation ratios along slot→paw when joint detection fails.
-const FALLBACK_THIGH_T   = 0.35;
-const FALLBACK_KNEE_T    = 0.70;
 
 // Pull a single keypoint from the current serverResponse with a confidence floor.
 function getRawKp(id, minConf = DETAIL_CONFIDENCE) {
@@ -548,10 +552,16 @@ function drawConstruction(an, ox, oy, sc, ctx, forPrint) {
   drawMassEllipse(an.withers, shoulder_fr_kp, SHOULDER_AXIS_RATIO);
 
   // ── Legs ───────────────────────────────────────────────────────────────────
+  // 4-segment construction (Loomis / Walt Stanchfield style):
+  //   thigh (hip/shoulder) → knee (stifle/elbow) → hock/wrist → paw
+  // The `thai` keypoint *is* the body attachment — no separate body-circle slot.
+  // Hock (rear) and wrist (front) have no DLC keypoint; we interpolate them
+  // along knee→paw at HOCK_WRIST_T. Joint balls scale by anatomical importance.
   strokeCol(legColor, 200, lineW);
   noF();
 
-  // Body-circle centres in image-space (not canvas-space) for paw-driven slots.
+  // Body-circle centres in image-space, used only as a fallback when the
+  // *_thai keypoint isn't detected.
   const frontC_img = add(an.withers, belly_dir, R);
   const backC_img  = add(an.hip,     belly_dir, R);
 
@@ -562,38 +572,57 @@ function drawConstruction(an, ox, oy, sc, ctx, forPrint) {
     { fallbackAngle: SLOT_BACK_RIGHT_DEG,  center: an.hip,     bodyC: backC_img,  paw: an.paw_br, thighId: KP.thigh_br, kneeId: KP.knee_br },
   ];
 
-  const jointR = KNEE_CIRCLE_K * Rsc * 0.75;   // small ball at thigh + knee
+  function cappedJointR(base, ...adjacent) {
+    return Math.min(base, ...adjacent.map(l => l * 0.45));
+  }
+
   for (const leg of legDefs) {
-    // Prefer paw-driven slot: where the body circle edge faces the paw.
-    let sImage;
     const pawValid = leg.paw && leg.paw.source !== 'ghost';
-    if (pawValid) {
+
+    // Thigh = the leg's body attachment (shoulder for front, hip for rear).
+    const thighRaw = getRawKp(leg.thighId);
+    let thigh_img;
+    if (thighRaw) {
+      thigh_img = thighRaw;
+    } else if (pawValid) {
+      // Paw-driven fallback: body-circle edge facing the paw.
       const dx = leg.paw.x - leg.bodyC.x, dy = leg.paw.y - leg.bodyC.y;
       const d = Math.hypot(dx, dy) || 1;
-      sImage = { x: leg.bodyC.x + (dx/d) * R, y: leg.bodyC.y + (dy/d) * R };
+      thigh_img = { x: leg.bodyC.x + (dx/d) * R, y: leg.bodyC.y + (dy/d) * R };
     } else {
-      sImage = slotPos(leg.center, frame, leg.fallbackAngle);
+      thigh_img = slotPos(leg.center, frame, leg.fallbackAngle);
     }
-    const sx = ox + sImage.x * sc, sy = oy + sImage.y * sc;
+    const tx = ox + thigh_img.x * sc, ty = oy + thigh_img.y * sc;
     const pw = px(leg.paw), ph = py(leg.paw);
 
-    // Three-segment leg: slot → thigh → knee → paw.
-    // Detected thigh/knee keypoints stay where the model placed them; otherwise
-    // fall back to interpolation along the slot→paw line.
-    const thighRaw = getRawKp(leg.thighId);
-    const kneeRaw  = getRawKp(leg.kneeId);
-    const thighSx = thighRaw ? ox + thighRaw.x * sc : sx + (pw - sx) * FALLBACK_THIGH_T;
-    const thighSy = thighRaw ? oy + thighRaw.y * sc : sy + (ph - sy) * FALLBACK_THIGH_T;
-    const kneeSx  = kneeRaw  ? ox + kneeRaw.x  * sc : sx + (pw - sx) * FALLBACK_KNEE_T;
-    const kneeSy  = kneeRaw  ? oy + kneeRaw.y  * sc : sy + (ph - sy) * FALLBACK_KNEE_T;
+    // Knee/elbow: detected or midpoint of thigh→paw.
+    const kneeRaw = getRawKp(leg.kneeId);
+    const knee_img = kneeRaw
+      ? kneeRaw
+      : { x: (thigh_img.x + leg.paw.x) / 2, y: (thigh_img.y + leg.paw.y) / 2 };
+    const kx = ox + knee_img.x * sc, ky = oy + knee_img.y * sc;
 
-    drawLine(sx, sy, thighSx, thighSy);
-    drawLine(thighSx, thighSy, kneeSx, kneeSy);
-    drawLine(kneeSx, kneeSy, pw, ph);
+    // Hock/wrist: interpolated along knee→paw.
+    const wx = kx + (pw - kx) * HOCK_WRIST_T;
+    const wy = ky + (ph - ky) * HOCK_WRIST_T;
 
-    // Joint balls (thigh smaller, knee bigger so the bend reads as the major joint)
-    drawCircle(thighSx, thighSy, jointR * 0.8);
-    drawCircle(kneeSx,  kneeSy,  jointR);
+    // Polyline: thigh → knee → hock/wrist → paw.
+    drawLine(tx, ty, kx, ky);
+    drawLine(kx, ky, wx, wy);
+    drawLine(wx, wy, pw, ph);
+
+    // Joint balls. Sizes capped by adjacent segment length so they never swamp.
+    const segTK = Math.hypot(kx - tx, ky - ty);
+    const segKW = Math.hypot(wx - kx, wy - ky);
+    const segWP = Math.hypot(pw - wx, ph - wy);
+
+    const rHipShoulder = cappedJointR(JOINT_R_HIP_SHOULDER * Rsc, segTK);
+    const rKneeElbow   = cappedJointR(JOINT_R_KNEE_ELBOW   * Rsc, segTK, segKW);
+    const rHockWrist   = cappedJointR(JOINT_R_HOCK_WRIST   * Rsc, segKW, segWP);
+
+    drawCircle(tx, ty, rHipShoulder);
+    drawCircle(kx, ky, rKneeElbow);
+    drawCircle(wx, wy, rHockWrist);
   }
 
   // ── Tail ───────────────────────────────────────────────────────────────────
