@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# Model weights (large binaries — pulled separately, not versioned)
+*.pt
+*.pth
+*.onnx
+snapshot-*.data-*
+snapshot-*.index
+snapshot-*.meta
+snapshot-*.pb
+snapshot-*.pbtxt
+
+# UV / pip caches
+.locks/
+CACHEDIR.TAG
+
+# Editor / OS junk
+.DS_Store
+.idea/
+.vscode/
+
+# Local-only test outputs / scratch
+*.log
+/tmp_*
+dog-pose/sketch/user_dog.*
+dog-pose/sketch/test_dog*
+
+# Claude harness local state (keep launch.json, drop session-local stuff)
+.claude/settings.local.json

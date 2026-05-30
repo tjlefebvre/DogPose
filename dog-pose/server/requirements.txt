@@ -1,0 +1,9 @@
+flask
+flask-cors
+torch
+torchvision
+dlclibrary
+Pillow
+numpy
+# tensorflow-metal intentionally excluded — crashes on M4 (MPSConv2DBackpropInputOp SIGSEGV)
+
