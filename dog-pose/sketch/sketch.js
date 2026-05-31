@@ -52,12 +52,20 @@ const SHOULDER_LENGTH_SCALE = 0.55;   // shoulder span = this × (withers↔thai
 // so the visible ellipse wraps the joint instead of stopping at the keypoint.
 const MASS_LENGTH_OVERSHOOT = 0.20;
 
+// ── Config ───────────────────────────────────────────────────────────────────
+// Pose server endpoint. Default is port 5000 (see dog-pose/server/server.py).
+// NOTE: on macOS the AirPlay Receiver squats on :5000 — if you can't free it
+// (System Settings → General → AirDrop & Handoff → AirPlay Receiver), run the
+// server on another port and change this to match, e.g. ":5001".
+const PREDICT_URL = "http://127.0.0.1:5000/predict";
+
 // ── State ────────────────────────────────────────────────────────────────────
 let img       = null;
 let serverResponse = null;   // full response from /predict: {keypoints, bbox, failed, image_size}
 let anchors   = null;        // extracted 10-anchor map
 let loading   = false;
 let hideHandles = false;
+let imageSeq  = 0;           // increments per uploaded image; suffixes download filenames
 
 // Drag state
 let dragIdx   = -1;          // index into ANCHOR_IDS being dragged
@@ -144,6 +152,7 @@ function setup() {
   document.getElementById("fileInput").addEventListener("change", handleFile);
   document.getElementById("dlOverlay").addEventListener("click", downloadOverlay);
   document.getElementById("dlComposite").addEventListener("click", downloadComposite);
+  document.getElementById("dlLines").addEventListener("click", downloadLines);
   document.getElementById("toggleHandles").addEventListener("click", () => {
     hideHandles = !hideHandles;
     document.getElementById("toggleHandles").textContent =
@@ -162,6 +171,7 @@ function handleFile(e) {
       img = loaded;
       serverResponse = null;
       anchors = null;
+      imageSeq += 1;          // new image → new filename number group
       redraw();
       sendToServer(file);
     });
@@ -177,7 +187,7 @@ function sendToServer(file) {
   const formData = new FormData();
   formData.append("image", file);
 
-  fetch("http://127.0.0.1:5000/predict", { method: "POST", body: formData })
+  fetch(PREDICT_URL, { method: "POST", body: formData })
     .then((r) => r.json())
     .then((data) => {
       if (data.error) { setStatus("Error: " + data.error); return; }
@@ -1127,6 +1137,24 @@ function mouseMoved() {
 function dist2(x1, y1, x2, y2) { return Math.hypot(x1-x2, y1-y2); }
 
 // ── Download ──────────────────────────────────────────────────────────────────
+// Zero-padded image number so successive captures don't overwrite each other.
+function seqTag() { return String(imageSeq).padStart(3, "0"); }
+
+// Construction lines ONLY, on a transparent background — no photo, no fill.
+// For tracing-paper printing or compositing the guide in other software.
+function downloadLines() {
+  if (!img || !anchors) return;
+  const sc = Math.min(width / img.width, height / img.height);
+  const dw = img.width * sc, dh = img.height * sc;
+  const ox = (width - dw) / 2, oy = (height - dh) / 2;
+
+  const g = createGraphics(width, height);
+  g.clear();                                        // fully transparent background
+  drawConstruction(anchors, ox, oy, sc, g, true);   // forPrint=true → no handles
+  saveCanvas(g, "dog_pose_lines_" + seqTag(), "png");
+  g.remove();
+}
+
 function downloadOverlay() {
   if (!img || !anchors) return;
 
@@ -1176,12 +1204,12 @@ function downloadOverlay() {
     ly += 14;
   }
 
-  saveCanvas(g, "dog_pose_print", "png");
+  saveCanvas(g, "dog_pose_print_" + seqTag(), "png");
   g.remove();
 }
 
 function downloadComposite() {
-  if (!img || !anchors) { saveCanvas("dog_pose_composite", "png"); return; }
+  if (!img || !anchors) { saveCanvas("dog_pose_composite_" + seqTag(), "png"); return; }
 
   const sc = Math.min(width / img.width, height / img.height);
   const dw = img.width * sc, dh = img.height * sc;
@@ -1191,7 +1219,7 @@ function downloadComposite() {
   g.background(30);
   g.image(img, ox, oy, dw, dh);
   drawConstruction(anchors, ox, oy, sc, g, true);   // forPrint=true → no handles
-  saveCanvas(g, "dog_pose_composite", "png");
+  saveCanvas(g, "dog_pose_composite_" + seqTag(), "png");
   g.remove();
 }
 
