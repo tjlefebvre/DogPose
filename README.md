@@ -22,6 +22,19 @@ photo
 A Python/Flask server runs detection + pose; a browser sketch (p5.js) does the
 rendering and interaction.
 
+## Output examples
+
+Same photo, two renderer generations. Phase 2 adds a silhouette-bounded body,
+shoulder/haunch mass ovals, and 4-segment legs with joint balls over the
+original Phase 1 construction.
+
+| Phase 2 (current) | Phase 1 (initial) |
+|---|---|
+| ![Phase 2](docs/phase2-overlay.png) | ![Phase 1](docs/phase1-overlay.png) |
+
+See [docs/](docs/README.md) for all four variants (overlay + clean construction
+sheet) and a breakdown of what each phase adds.
+
 ## Repo layout
 
 | Path | What |
