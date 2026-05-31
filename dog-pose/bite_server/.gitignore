@@ -1,0 +1,4 @@
+# Spike artifacts — bulky, not source. Keep dirs, ignore contents.
+spike_outputs/*
+spike_inputs/*
+!.gitkeep
