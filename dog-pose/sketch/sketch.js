@@ -15,6 +15,14 @@ const HOCK_WRIST_T         = 0.55;
 // Silhouette backdrop opacity (0–255). Low — the polygon is contextual, not
 // dominant. Bumped/dimmed in Chunk F tuning.
 const SILHOUETTE_OPACITY   = 75;
+
+// Body-radius bounds derived from the silhouette's short axis (computed in
+// the spine frame). The keypoint-based R = BODY_RADIUS_K × dist(withers, hip)
+// is forced into [LO, HI] × short-axis, so a) lying-down dogs with huge
+// spine spans don't get balloon body circles, b) face-on / sitting poses
+// with collapsed spine don't get pinhole-sized ones.
+const R_SHORT_AXIS_LO      = 0.15;
+const R_SHORT_AXIS_HI      = 0.40;
 // Slot angles in frame {x=spine_dir (withers→hip), y=belly_dir (toward paws)}.
 // 0°=back of dog, 90°=down/belly, 180°=forward/nose, 270°=up/back-of-spine.
 // Legs hang from the belly side: front legs forward+down (~135°), back legs back+down (~45°).
@@ -342,6 +350,32 @@ function extractAnchors(data) {
     hip = ghostPos('hip');
   }
 
+  // ── Silhouette sanity for withers + hip ────────────────────────────────────
+  // If withers / hip fell outside the silhouette polygon, the model placed
+  // them somewhere they shouldn't be (caught e.g. on sitting profile dogs,
+  // where back_end can drift behind the dog). Snap back to a fallback
+  // computed from points we trust.
+  const silhouette_raw = data.silhouette;
+  if (silhouette_raw && silhouette_raw.length >= 3) {
+    if (!pointInPolygon(withers, silhouette_raw)) {
+      if (head_ref && tail_base_raw) {
+        const wx = head_ref.x + (tail_base_raw.x - head_ref.x) * 0.30;
+        const wy = head_ref.y + (tail_base_raw.y - head_ref.y) * 0.30;
+        if (pointInPolygon({x: wx, y: wy}, silhouette_raw)) {
+          withers = tag(wx, wy, 0, 'inferred');
+        }
+      }
+    }
+    if (!pointInPolygon(hip, silhouette_raw)) {
+      if (tail_base_raw) {
+        const fallback = hipFromTail(tail_base_raw, withers);
+        if (pointInPolygon(fallback, silhouette_raw)) {
+          hip = fallback;
+        }
+      }
+    }
+  }
+
   const tail_base = tail_base_raw || hipFromTail(hip, withers);
   const tail_end  = anchor('tail_end', KP.tail_end) || ghostPos('tail_end');
 
@@ -387,6 +421,45 @@ function perp(v)      { return { x: -v.y, y: v.x }; }   // 90° CCW
 function mid(a, b)    { return { x: (a.x+b.x)/2, y: (a.y+b.y)/2 }; }
 function add(a, v, s) { return { x: a.x + v.x*s, y: a.y + v.y*s }; }   // a + v*s
 function vdist(a, b)  { return Math.hypot(b.x-a.x, b.y-a.y); }
+
+function pointInPolygon(p, poly) {
+  // Standard ray-casting test. poly is an array of [x, y] pairs.
+  if (!poly || poly.length < 3) return false;
+  let inside = false;
+  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+    const xi = poly[i][0], yi = poly[i][1];
+    const xj = poly[j][0], yj = poly[j][1];
+    const crosses = (yi > p.y) !== (yj > p.y);
+    if (crosses && p.x < ((xj - xi) * (p.y - yi)) / ((yj - yi) || 1e-9) + xi) {
+      inside = !inside;
+    }
+  }
+  return inside;
+}
+
+function silhouetteAxisExtents(poly, origin, axisDir) {
+  // Project poly vertices onto `axisDir` (and its perpendicular) around
+  // `origin`, returning {alongMin, alongMax, perpMax, alongExtent, perpExtent}.
+  // Used to compute the silhouette's bounding rectangle in a spine-aligned
+  // frame.
+  if (!poly || poly.length < 3) return null;
+  const perpDir = { x: -axisDir.y, y: axisDir.x };
+  let alongMin = Infinity, alongMax = -Infinity, perpMin = Infinity, perpMax = -Infinity;
+  for (const [vx, vy] of poly) {
+    const dx = vx - origin.x, dy = vy - origin.y;
+    const a = dx * axisDir.x + dy * axisDir.y;
+    const p = dx * perpDir.x + dy * perpDir.y;
+    if (a < alongMin) alongMin = a;
+    if (a > alongMax) alongMax = a;
+    if (p < perpMin) perpMin = p;
+    if (p > perpMax) perpMax = p;
+  }
+  return {
+    alongMin, alongMax, perpMin, perpMax,
+    alongExtent: alongMax - alongMin,
+    perpExtent:  perpMax  - perpMin,
+  };
+}
 
 function silhouetteCentroid(poly) {
   // Shoelace centroid of a closed polygon. Falls back to vertex average for
@@ -442,20 +515,30 @@ function computeFrame(an) {
   const S = vdist(an.withers, an.hip);
   let   R = BODY_RADIUS_K * S;
 
-  // Silhouette-driven radius clamp: the keypoint-derived R sometimes blows up
-  // (e.g. when withers / hip are mispredicted far apart). The silhouette gives
-  // us the dog's actual half-width perpendicular to the spine — if R exceeds
-  // that by > 30%, clamp it gently back to ~115% of the half-width.
+  // Silhouette-driven radius bounds.
+  //
+  // The keypoint-derived R can either blow up (lying dog with huge spine
+  // span — body circles dominate the whole frame) OR collapse (face-on /
+  // sitting dog where the spine is foreshortened — pinhole body circles).
+  // Both modes are fixed by clamping R into a band derived from the
+  // silhouette's short-axis extent in the spine frame.
+  //
+  //   short = min(extent along spine, extent perpendicular to spine)
+  //   R ∈ [short × R_SHORT_AXIS_LO,  short × R_SHORT_AXIS_HI]
+  //
+  // The short axis tracks the dog's body cross-section reasonably across
+  // poses, while being robust to limb sprawl (which only inflates the
+  // longer axis).
   if (silhouette && silhouette.length >= 3) {
-    const perpDir = perp(spine_dir);  // unit perpendicular to spine
-    let maxAbsPerp = 0;
-    for (const [vx, vy] of silhouette) {
-      const dx = vx - spineCenter.x, dy = vy - spineCenter.y;
-      const along = Math.abs(dx * perpDir.x + dy * perpDir.y);
-      if (along > maxAbsPerp) maxAbsPerp = along;
-    }
-    if (maxAbsPerp > 1 && R > maxAbsPerp * 1.3) {
-      R = maxAbsPerp * 1.15;
+    const ext = silhouetteAxisExtents(silhouette, spineCenter, spine_dir);
+    if (ext) {
+      const short = Math.min(ext.alongExtent, ext.perpExtent);
+      if (short > 1) {
+        const R_lo = short * R_SHORT_AXIS_LO;
+        const R_hi = short * R_SHORT_AXIS_HI;
+        if (R < R_lo) R = R_lo;
+        if (R > R_hi) R = R_hi;
+      }
     }
   }
 
